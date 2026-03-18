@@ -1,0 +1,1057 @@
+;; =============================================================================
+;; IMPL-001: CBCL-Nostr — Agent Communication over Nostr Relays
+;; =============================================================================
+;; Implements NIP-XX (nip-xx-agent-communication.md) using cbcl-rs primitives
+;; mapped to Nostr event kinds 21111 (messages) and 31111 (dialects).
+;;
+;; Spec: SPEC-001 (nip-xx-agent-communication.md)
+;; Upstream: cbcl-rs (../cbcl-rs) — formally verified CBCL runtime
+;; Protocol: USDD Agent Protocol (../handbook/engineering/usdd-agent-protocol.md)
+;; =============================================================================
+
+(meta plan
+  (id "IMPL-001")
+  (title "CBCL-Nostr: Agent Communication over Nostr")
+  (version "1.1.0")
+  (status "active")
+  (created "2026-03-18")
+  (author "agent:architect")
+  (spec "SPEC-001")
+  (description "Implement CBCL agent communication protocol over Nostr relays, mapping cbcl-rs core (S-expressions, performatives, dialects, R1-R4 safety) to NIP-01 events with Lightning payment integration (NIP-57)."))
+
+;; =============================================================================
+;; AGENTS
+;; =============================================================================
+
+(given agent-core-available)
+(given agent-transport-available)
+(given agent-protocol-available)
+(given agent-commerce-available)
+(given agent-security-available)
+(given agent-test-available)
+
+;; =============================================================================
+;; PHASE 1: CORE TYPES — Nostr event ↔ CBCL message mapping
+;; =============================================================================
+
+(given task-event-types)
+(given task-sexpr-codec)
+(given task-performative-tags)
+(given task-message-builder)
+
+(given no-deps-event-types)
+(given no-deps-sexpr-codec)
+
+(meta task-event-types
+  (description "Define Rust types for kind 21111 (AgentMessage) and kind 31111 (AgentDialect) Nostr events. Map NIP-01 event structure (id, pubkey, created_at, kind, tags, content, sig) to typed wrappers. Include tag enums: p, performative, thread, e, dialect, t, amount, L, l.")
+  (acceptance "REQ-010: All 8 core performatives representable. REQ-020: kind 21111 round-trips through serde. REQ-021: kind 31111 round-trips. NFR-010: Zero-copy deserialization for content field."))
+
+(meta task-sexpr-codec
+  (description "Integrate cbcl-rs SExpr parser/serializer for Nostr event content fields. Parse content string → SExpr, serialize SExpr → content string. Reuse cbcl-rs parse() with fuel bounds. Map Atom variants (Symbol, Str, Num, Bool, Keyword) to/from JSON-safe strings.")
+  (acceptance "REQ-030: Parse all CBCL S-expression content examples from NIP-XX. REQ-031: Serialize back to identical string. NFR-020: ≤ 1µs/KiB parse (match cbcl-rs benchmark). Property test: parse(serialize(x)) == x for all valid SExpr."))
+
+(meta task-performative-tags
+  (description "Extract performative from parsed SExpr content and validate against the performative tag. Ensure head symbol of content S-expression matches the performative tag value. Handle both core (tell/ask/reply/ok/error/cancel/hello/bye) and dialect-extended performatives.")
+  (acceptance "REQ-040: Reject events where content head symbol ≠ performative tag. REQ-041: Dialect performatives require dialect tag present. ADR-001: Use cbcl-rs msg_tag() for deterministic classification."))
+
+(meta task-message-builder
+  (description "Builder API for constructing kind 21111 events from CBCL message parameters. Accept performative + recipient + content + thread + optional dialect → produce complete unsigned Nostr event with correct tags. Handle broadcast messages (hello/bye) without p tag.")
+  (acceptance "REQ-050: Build all example events from NIP-XX spec. REQ-051: Broadcast performatives omit p tag. REQ-052: Thread tag auto-propagated in replies. CON-010: MessageBuilder::new().tell(pubkey, content).thread(id).build() → UnsignedEvent."))
+
+;; Phase 1 readiness
+(normally r-ready-event-types
+  (and task-event-types no-deps-event-types)
+  ready-event-types)
+
+(normally r-ready-sexpr-codec
+  (and task-sexpr-codec no-deps-sexpr-codec)
+  ready-sexpr-codec)
+
+(normally r-ready-performative-tags
+  (and task-performative-tags completed-event-types completed-sexpr-codec)
+  ready-performative-tags)
+
+(normally r-ready-message-builder
+  (and task-message-builder completed-event-types completed-performative-tags)
+  ready-message-builder)
+
+;; Phase 1 assignments
+(normally r-assign-core-event-types
+  (and ready-event-types agent-core-available)
+  assign-to-event-types-core)
+
+(normally r-assign-core-sexpr-codec
+  (and ready-sexpr-codec agent-core-available)
+  assign-to-sexpr-codec-core)
+
+(normally r-assign-core-performative-tags
+  (and ready-performative-tags agent-core-available)
+  assign-to-performative-tags-core)
+
+(normally r-assign-core-message-builder
+  (and ready-message-builder agent-core-available)
+  assign-to-message-builder-core)
+
+;; =============================================================================
+;; PHASE 2: TRANSPORT — Relay connection & event signing
+;; =============================================================================
+
+(given task-relay-pool)
+(given task-event-signing)
+(given task-subscription-manager)
+(given task-inbox-handler)
+(given task-spam-prevention)
+
+(meta task-relay-pool
+  (description "WebSocket connection pool to Nostr relays. Connect to multiple relays, publish events, receive events. Handle reconnection, relay policy negotiation, and OK/CLOSED responses per NIP-01. Use tokio for async I/O.")
+  (acceptance "REQ-060: Connect to ≥ 3 relays concurrently. REQ-061: Publish event returns OK confirmation from ≥ 1 relay. REQ-062: Automatic reconnection on disconnect. NFR-030: Event publish latency ≤ 500ms p95 to first relay OK."))
+
+(meta task-event-signing
+  (description "Sign Nostr events with secp256k1 Schnorr signatures per NIP-01. Compute event ID as sha256 of canonical serialization [0, pubkey, created_at, kind, tags, content]. Sign with agent's private key. Verify incoming event signatures. Includes NIP-44 encrypt/decrypt primitives for use by downstream encryption tasks.")
+  (acceptance "REQ-070: Signed events pass NIP-01 verification. REQ-071: Invalid signatures rejected before CBCL parsing. REQ-072: Event ID computed per NIP-01 canonical serialization, verified against ≥ 3 known-good test vectors from nostr-tools. REQ-073: NIP-44 versioned encryption encrypt/decrypt exposed as public API. ADR-002: Use nostr-sdk or secp256k1 crate for crypto, do not roll own. NFR-040: Sign ≤ 100µs per event."))
+
+(meta task-subscription-manager
+  (description "Manage Nostr REQ subscriptions for agent communication patterns: inbox (messages to me), dialect listener, bounty board, agent discovery, dialect registry. Map NIP-XX filter patterns to subscription lifecycle. Handle EOSE for initial sync vs real-time.")
+  (acceptance "REQ-080: All 6 subscription patterns from NIP-XX functional. REQ-081: EOSE signals transition from backfill to real-time. REQ-082: Subscription deduplication across relays. CON-020: subscribe(filter) → Stream<AgentMessage>."))
+
+(meta task-inbox-handler
+  (description "Core message dispatch: receive kind 21111 events from subscriptions, verify signature, parse CBCL content, validate performative tag consistency, route to handler by performative type. Emit typed AgentMessage to application layer. Reject messages with unknown dialect tags until the dialect is installed in the local registry (matches cbcl-rs registry search-order semantics).")
+  (acceptance "REQ-090: Messages dispatched within 10ms of relay delivery. REQ-091: Invalid events (bad sig, bad CBCL, tag mismatch) rejected with structured error. REQ-092: Thread messages grouped by thread tag. REQ-093: Messages with dialect tag rejected if dialect not in local DialectRegistry, with structured UnknownDialect error."))
+
+(meta task-spam-prevention
+  (description "Implement relay-side and client-side spam defenses. Client: rate-limit outgoing messages per relay policy. Support NIP-13 proof-of-work on broadcast events. Verify incoming events against pubkey allowlists. Support zap-gating (require payment history for broadcasts).")
+  (acceptance "REQ-085: POW configurable per event type (broadcast vs directed). REQ-086: Rate limiter respects relay CLOSED responses. REQ-087: Allowlist/blocklist for agent pubkeys. REQ-088: Zap-gate check queries kind 9735 before accepting broadcast tasks."))
+
+;; Phase 2 readiness (depends on Phase 1 completion)
+(normally r-ready-relay-pool
+  (and task-relay-pool completed-event-types)
+  ready-relay-pool)
+
+(normally r-ready-event-signing
+  (and task-event-signing completed-event-types)
+  ready-event-signing)
+
+(normally r-ready-subscription-manager
+  (and task-subscription-manager completed-relay-pool completed-performative-tags)
+  ready-subscription-manager)
+
+(normally r-ready-spam-prevention
+  (and task-spam-prevention completed-relay-pool completed-subscription-manager)
+  ready-spam-prevention)
+
+(normally r-ready-inbox-handler
+  (and task-inbox-handler completed-subscription-manager completed-sexpr-codec completed-message-builder)
+  ready-inbox-handler)
+
+;; Phase 2 assignments
+(normally r-assign-transport-relay-pool
+  (and ready-relay-pool agent-transport-available)
+  assign-to-relay-pool-transport)
+
+(normally r-assign-transport-event-signing
+  (and ready-event-signing agent-transport-available)
+  assign-to-event-signing-transport)
+
+(normally r-assign-transport-subscription-manager
+  (and ready-subscription-manager agent-transport-available)
+  assign-to-subscription-manager-transport)
+
+(normally r-assign-security-spam-prevention
+  (and ready-spam-prevention agent-security-available)
+  assign-to-spam-prevention-security)
+
+(normally r-assign-transport-inbox-handler
+  (and ready-inbox-handler agent-transport-available)
+  assign-to-inbox-handler-transport)
+
+;; =============================================================================
+;; PHASE 3: PROTOCOL — Discovery, conversation, dialect negotiation
+;; =============================================================================
+
+(given task-agent-profile)
+(given task-agent-discovery)
+(given task-conversation-threads)
+(given task-dialect-negotiation)
+(given task-dialect-safety)
+
+(meta task-agent-profile
+  (description "Publish agent identity as kind 0 (user metadata) per NIP-01. Set name, about, picture fields for the agent's pubkey so Nostr clients can display a human-readable identity. Publish on startup and on profile change. Query other agents' kind 0 events to resolve pubkey → display name.")
+  (acceptance "REQ-095: Agent publishes kind 0 with name, about, picture on startup. REQ-096: kind 0 event replaces previous (replaceable event semantics). REQ-097: Resolve other agents' pubkeys to display names via kind 0 lookup."))
+
+(meta task-agent-discovery
+  (description "Implement hello/bye broadcast protocol. Publish hello with capabilities list and agent-type. Subscribe to hello events for agent directory. Maintain local agent registry with last-seen timestamps and capabilities. Handle bye for graceful departure.")
+  (acceptance "REQ-100: hello broadcast reaches ≥ 1 relay. REQ-101: Agent registry updated within 5s of hello receipt. REQ-102: bye removes agent from active registry. REQ-103: Stale agents (no hello in 24h) marked inactive."))
+
+(meta task-conversation-threads
+  (description "Thread management for multi-turn agent conversations. Generate thread IDs, track conversation state (open/completed/cancelled), link reply chains via e tags. Support both directed (tell/ask/reply) and broadcast (hello/bye) patterns.")
+  (acceptance "REQ-110: Thread state machine: open → {completed(ok), cancelled(cancel), error}. REQ-111: e tag chain preserves conversation ordering. REQ-112: Thread timeout after configurable inactivity period. CON-030: Conversation::new(thread_id) with .send()/.receive()/.complete() lifecycle."))
+
+(meta task-dialect-negotiation
+  (description "Publish and discover CBCL dialect definitions as kind 31111 addressable events. Query relay for available dialects by L/l namespace tags. Parse dialect S-expression from event content. Install verified dialects into agent's dialect registry (cbcl-rs DialectRegistry).")
+  (acceptance "REQ-120: Publish dialect as kind 31111 with d tag = dialect name. REQ-121: Discover dialects by namespace query. REQ-122: Dialect content parsed and installed into cbcl-rs registry. REQ-123: Dialect messages tagged with dialect name in dialect tag."))
+
+(meta task-dialect-safety
+  (description "Verify CBCL safety constraints R1-R4 on received dialect definitions before installation. R1: no recursion (cbcl-rs verify_r1). R2: resource bounds valid (verify_r2). R3: core performatives preserved (verify_r3). R4: provenance via Nostr pubkey signature (verify_r4 using event sig as provenance).")
+  (acceptance "REQ-130: All 4 safety constraints checked before dialect install. REQ-131: R4 provenance derived from Nostr event signature (author = event pubkey). REQ-132: Failed verification emits structured rejection with constraint ID. REQ-133: Malicious dialect definitions (recursive, unbounded, core-shadowing) rejected in < 100µs."))
+
+;; Phase 3 readiness
+(normally r-ready-agent-profile
+  (and task-agent-profile completed-relay-pool completed-event-signing)
+  ready-agent-profile)
+
+(normally r-ready-agent-discovery
+  (and task-agent-discovery completed-message-builder completed-subscription-manager completed-spam-prevention completed-agent-profile)
+  ready-agent-discovery)
+
+(normally r-ready-conversation-threads
+  (and task-conversation-threads completed-inbox-handler completed-message-builder)
+  ready-conversation-threads)
+
+(normally r-ready-dialect-negotiation
+  (and task-dialect-negotiation completed-relay-pool completed-sexpr-codec completed-event-signing)
+  ready-dialect-negotiation)
+
+(normally r-ready-dialect-safety
+  (and task-dialect-safety completed-dialect-negotiation completed-sexpr-codec)
+  ready-dialect-safety)
+
+;; Phase 3 assignments
+(normally r-assign-protocol-agent-profile
+  (and ready-agent-profile agent-protocol-available)
+  assign-to-agent-profile-protocol)
+
+(normally r-assign-protocol-agent-discovery
+  (and ready-agent-discovery agent-protocol-available)
+  assign-to-agent-discovery-protocol)
+
+(normally r-assign-protocol-conversation-threads
+  (and ready-conversation-threads agent-protocol-available)
+  assign-to-conversation-threads-protocol)
+
+(normally r-assign-protocol-dialect-negotiation
+  (and ready-dialect-negotiation agent-protocol-available)
+  assign-to-dialect-negotiation-protocol)
+
+(normally r-assign-security-dialect-safety
+  (and ready-dialect-safety agent-security-available)
+  assign-to-dialect-safety-security)
+
+;; Security agent takes priority for safety verification
+(prefer r-assign-security-dialect-safety r-assign-protocol-dialect-negotiation)
+
+(meta r-assign-security-dialect-safety
+  (description "Safety-critical task: dialect verification must be reviewed by security agent")
+  (justification "R1-R4 constraints are the core security boundary; per USDD Tier 1 review required for cryptography-adjacent work"))
+
+;; =============================================================================
+;; PHASE 4: COMMERCE — Lightning payments & reputation
+;; =============================================================================
+
+(given task-commerce-dialect)
+(given task-zap-integration)
+(given task-reputation-query)
+(given task-open-task-market)
+
+(meta task-commerce-dialect
+  (description "Implement the commerce dialect definition from NIP-XX: quote, accept-quote, reject-quote, counter, invoice, paid performatives. Publish as kind 31111 event. Wrap all commerce messages in (lang commerce ...). Implement negotiation state machine: open → quoted → {accepted, rejected, countered} → working → completed → invoiced → paid.")
+  (acceptance "REQ-140: All 6 commerce performatives functional. REQ-141: Negotiation state machine enforced (no invoice before accept). REQ-142: Commerce messages wrapped in lang commerce. REQ-143: State transitions emitted as structured events for UI/logging."))
+
+(meta task-zap-integration
+  (description "Integrate NIP-57 Lightning Zaps for agent payment. Construct kind 9734 zap requests targeting task completion (ok) events. Parse kind 9735 zap receipts to confirm payment. Map zap amount to commerce invoice amount for reconciliation.")
+  (acceptance "REQ-150: Zap request references correct ok event ID. REQ-151: Zap receipt parsed and matched to pending invoice. REQ-152: Payment confirmation emitted to commerce state machine. ADR-003: Use NIP-57 zaps, not custom payment channel."))
+
+(meta task-reputation-query
+  (description "Query agent reputation from on-relay data. Aggregate kind 9735 zap receipts for a pubkey to compute: total earnings, completion rate, domain expertise (by dialect tags). Provide reputation summary for task assignment decisions.")
+  (acceptance "REQ-160: Reputation query returns earnings + completion rate for any pubkey. REQ-161: Results cacheable with configurable TTL. REQ-162: Reputation factors weighted by recency. NFR-050: Query ≤ 2s for agent with 1000 zap receipts."))
+
+(meta task-open-task-market
+  (description "Open task publishing and claiming. Publish tasks without p tag (broadcast). Support amount tag for fixed-price tasks. Implement claim protocol: agent replies to open task, conversation becomes directed. Handle concurrent claims (first-reply-wins or publisher-chooses).")
+  (acceptance "REQ-170: Open tasks discoverable via bounty board subscription. REQ-171: Claim converts broadcast task to directed thread. REQ-172: Fixed-price tasks skip commerce negotiation. REQ-173: Publisher can accept/reject claims."))
+
+;; Phase 4 readiness
+(normally r-ready-commerce-dialect
+  (and task-commerce-dialect completed-dialect-negotiation completed-dialect-safety completed-conversation-threads)
+  ready-commerce-dialect)
+
+(normally r-ready-zap-integration
+  (and task-zap-integration completed-commerce-dialect completed-event-signing)
+  ready-zap-integration)
+
+(normally r-ready-reputation-query
+  (and task-reputation-query completed-zap-integration completed-subscription-manager)
+  ready-reputation-query)
+
+(normally r-ready-open-task-market
+  (and task-open-task-market completed-commerce-dialect completed-agent-discovery)
+  ready-open-task-market)
+
+;; Phase 4 assignments
+(normally r-assign-commerce-commerce-dialect
+  (and ready-commerce-dialect agent-commerce-available)
+  assign-to-commerce-dialect-commerce)
+
+(normally r-assign-commerce-zap-integration
+  (and ready-zap-integration agent-commerce-available)
+  assign-to-zap-integration-commerce)
+
+(normally r-assign-commerce-reputation-query
+  (and ready-reputation-query agent-commerce-available)
+  assign-to-reputation-query-commerce)
+
+(normally r-assign-commerce-open-task-market
+  (and ready-open-task-market agent-commerce-available)
+  assign-to-open-task-market-commerce)
+
+;; =============================================================================
+;; PHASE 5: SECURITY HARDENING — Encryption, spam, trust
+;; =============================================================================
+
+(given task-gift-wrap)
+(given task-payment-safety)
+
+(meta task-gift-wrap
+  (description "Implement NIP-59 Gift Wrap for confidential agent communication. Wrap encrypted CBCL messages (using NIP-44 primitives from event-signing) in ephemeral-key outer events. Receiver unwraps outer event, decrypts inner content, then passes to inbox-handler for CBCL parsing. Support both encrypted direct messages and encrypted dialect definitions.")
+  (acceptance "REQ-180: Gift-wrapped messages indistinguishable from other NIP-59 events to relays. REQ-181: Unwrapped + decrypted content passes all CBCL validation. REQ-182: Thread tracking preserved through wrap/unwrap cycle. REQ-183: inbox-handler transparently unwraps before CBCL dispatch. NFR-060: Wrap/unwrap ≤ 500µs per message."))
+
+(meta task-payment-safety
+  (description "Payment safety guards per NIP-XX security considerations. Verify task publisher payment history before starting work. Validate amount tag consistency across negotiation. Detect and warn about payment-before-work patterns. Implement configurable trust thresholds.")
+  (acceptance "REQ-200: Agent checks publisher zap history before claiming task. REQ-201: Amount consistency validated across quote/accept/invoice chain. REQ-202: Configurable minimum publisher reputation threshold. REQ-203: Warning emitted for first-time publishers with no history."))
+
+;; Phase 5 readiness
+(normally r-ready-gift-wrap
+  (and task-gift-wrap completed-inbox-handler completed-message-builder completed-event-signing)
+  ready-gift-wrap)
+
+(normally r-ready-payment-safety
+  (and task-payment-safety completed-reputation-query completed-zap-integration)
+  ready-payment-safety)
+
+;; Phase 5 assignments — security agent for all
+(normally r-assign-security-gift-wrap
+  (and ready-gift-wrap agent-security-available)
+  assign-to-gift-wrap-security)
+
+(normally r-assign-security-payment-safety
+  (and ready-payment-safety agent-security-available)
+  assign-to-payment-safety-security)
+
+;; =============================================================================
+;; PHASE 6: INTEGRATION TESTING & VALIDATION
+;; =============================================================================
+
+(given task-integration-tests)
+(given task-differential-tests)
+(given task-e2e-scenario)
+
+(meta task-integration-tests
+  (description "Integration tests against real Nostr relays (test instances). Verify full message flow: sign → publish → subscribe → receive → parse → dispatch. Test dialect publish/discover/verify/install cycle. Test conversation thread lifecycle end-to-end.")
+  (acceptance "REQ-210: Tests run against ≥ 2 Nostr test relays. REQ-211: Full message round-trip verified for all 8 core performatives. REQ-212: Dialect lifecycle test covers publish → discover → R1-R4 verify → install → use. TEST-001 through TEST-008: One test per core performative."))
+
+(meta task-differential-tests
+  (description "Cross-verify CBCL message parsing between cbcl-nostr and cbcl-rs. Reuse cbcl-rs 156 test vectors. Ensure Nostr event wrapping does not alter CBCL semantics. Verify that parse(event.content) produces identical SExpr in both implementations.")
+  (acceptance "REQ-220: All 156 cbcl-rs test vectors pass through Nostr event round-trip. REQ-221: No semantic drift between cbcl-rs parse and cbcl-nostr parse. NFR-070: Differential test suite runs in ≤ 30s."))
+
+(meta task-e2e-scenario
+  (description "End-to-end scenario: two agents discover each other, negotiate a commerce dialect, publish an open task with bounty, claim it, negotiate price, complete work, invoice, and pay via Lightning zap. Full NIP-XX happy path in a single test.")
+  (acceptance "REQ-230: Scenario completes with zap receipt confirming payment. REQ-231: All conversation events verifiable on relay after test. REQ-232: Reputation query reflects completed task post-scenario."))
+
+;; Phase 6 readiness
+(normally r-ready-integration-tests
+  (and task-integration-tests completed-inbox-handler completed-conversation-threads completed-dialect-safety)
+  ready-integration-tests)
+
+(normally r-ready-differential-tests
+  (and task-differential-tests completed-sexpr-codec completed-event-types)
+  ready-differential-tests)
+
+(normally r-ready-e2e-scenario
+  (and task-e2e-scenario completed-integration-tests completed-open-task-market completed-zap-integration completed-reputation-query)
+  ready-e2e-scenario)
+
+;; Phase 6 assignments
+(normally r-assign-test-integration-tests
+  (and ready-integration-tests agent-test-available)
+  assign-to-integration-tests-test)
+
+(normally r-assign-test-differential-tests
+  (and ready-differential-tests agent-test-available)
+  assign-to-differential-tests-test)
+
+(normally r-assign-test-e2e-scenario
+  (and ready-e2e-scenario agent-test-available)
+  assign-to-e2e-scenario-test)
+
+;; =============================================================================
+;; RULE METADATA
+;; =============================================================================
+
+(meta r-ready-event-types
+  (description "Event types have no dependencies — can start immediately")
+  (justification "Foundation types needed by all other tasks"))
+
+(meta r-ready-sexpr-codec
+  (description "S-expression codec has no dependencies — can start immediately")
+  (justification "Reuses cbcl-rs parser directly, no Nostr-specific deps"))
+
+(meta r-ready-dialect-safety
+  (description "Safety verification depends on dialect negotiation completing")
+  (justification "Need dialect parsing infrastructure before adding verification layer"))
+
+(meta r-ready-e2e-scenario
+  (description "E2E scenario requires all commerce + discovery + testing infrastructure")
+  (justification "Full happy path exercises every layer of the stack"))
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T03:39:26Z"
+  (given delegated-v1-sexpr-codec-to-agent:claude)
+  (given (during (leased-v1-sexpr-codec) (moment "2026-03-18T03:39:26Z") (moment "2026-03-18T04:09:26Z")))
+  (given claim-v1-sexpr-codec-by-claude)
+  (normally r-cl-state-v1-sexpr-codec-by-claude claim-v1-sexpr-codec-by-claude state-claimed-v1-sexpr-codec-by-claude)
+  (normally r-cl-chain-v1-sexpr-codec-by-claude state-claimed-v1-sexpr-codec-by-claude claimed-sexpr-codec)
+)
+
+;; Propagation rules: failures in 'sexpr-codec' block downstream tasks
+(normally r-propagate-dialect-negotiation-from-sexpr-codec-failed failed-sexpr-codec upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-sexpr-codec-permanently-failed permanently-failed-sexpr-codec upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-sexpr-codec-stale-v1 stale-v1-sexpr-codec upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-sexpr-codec-timeout-v1 timeout-v1-sexpr-codec upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-sexpr-codec-blocked upstream-blocked-sexpr-codec upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-safety-from-sexpr-codec-failed failed-sexpr-codec upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-sexpr-codec-permanently-failed permanently-failed-sexpr-codec upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-sexpr-codec-stale-v1 stale-v1-sexpr-codec upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-sexpr-codec-timeout-v1 timeout-v1-sexpr-codec upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-sexpr-codec-blocked upstream-blocked-sexpr-codec upstream-blocked-dialect-safety)
+(normally r-propagate-differential-tests-from-sexpr-codec-failed failed-sexpr-codec upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-sexpr-codec-permanently-failed permanently-failed-sexpr-codec upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-sexpr-codec-stale-v1 stale-v1-sexpr-codec upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-sexpr-codec-timeout-v1 timeout-v1-sexpr-codec upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-sexpr-codec-blocked upstream-blocked-sexpr-codec upstream-blocked-differential-tests)
+(normally r-propagate-inbox-handler-from-sexpr-codec-failed failed-sexpr-codec upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-sexpr-codec-permanently-failed permanently-failed-sexpr-codec upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-sexpr-codec-stale-v1 stale-v1-sexpr-codec upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-sexpr-codec-timeout-v1 timeout-v1-sexpr-codec upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-sexpr-codec-blocked upstream-blocked-sexpr-codec upstream-blocked-inbox-handler)
+(normally r-propagate-performative-tags-from-sexpr-codec-failed failed-sexpr-codec upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-sexpr-codec-permanently-failed permanently-failed-sexpr-codec upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-sexpr-codec-stale-v1 stale-v1-sexpr-codec upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-sexpr-codec-timeout-v1 timeout-v1-sexpr-codec upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-sexpr-codec-blocked upstream-blocked-sexpr-codec upstream-blocked-performative-tags)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-commerce-dialect-from-dialect-negotiation-blocked upstream-blocked-dialect-negotiation upstream-blocked-commerce-dialect)
+(normally r-propagate-dialect-safety-from-dialect-negotiation-blocked upstream-blocked-dialect-negotiation upstream-blocked-dialect-safety)
+(normally r-propagate-commerce-dialect-from-dialect-safety-blocked upstream-blocked-dialect-safety upstream-blocked-commerce-dialect)
+(normally r-propagate-integration-tests-from-dialect-safety-blocked upstream-blocked-dialect-safety upstream-blocked-integration-tests)
+(normally r-propagate-conversation-threads-from-inbox-handler-blocked upstream-blocked-inbox-handler upstream-blocked-conversation-threads)
+(normally r-propagate-gift-wrap-from-inbox-handler-blocked upstream-blocked-inbox-handler upstream-blocked-gift-wrap)
+(normally r-propagate-integration-tests-from-inbox-handler-blocked upstream-blocked-inbox-handler upstream-blocked-integration-tests)
+(normally r-propagate-message-builder-from-performative-tags-blocked upstream-blocked-performative-tags upstream-blocked-message-builder)
+(normally r-propagate-subscription-manager-from-performative-tags-blocked upstream-blocked-performative-tags upstream-blocked-subscription-manager)
+(normally r-propagate-open-task-market-from-commerce-dialect-blocked upstream-blocked-commerce-dialect upstream-blocked-open-task-market)
+(normally r-propagate-zap-integration-from-commerce-dialect-blocked upstream-blocked-commerce-dialect upstream-blocked-zap-integration)
+(normally r-propagate-e2e-scenario-from-integration-tests-blocked upstream-blocked-integration-tests upstream-blocked-e2e-scenario)
+(normally r-propagate-commerce-dialect-from-conversation-threads-blocked upstream-blocked-conversation-threads upstream-blocked-commerce-dialect)
+(normally r-propagate-integration-tests-from-conversation-threads-blocked upstream-blocked-conversation-threads upstream-blocked-integration-tests)
+(normally r-propagate-agent-discovery-from-message-builder-blocked upstream-blocked-message-builder upstream-blocked-agent-discovery)
+(normally r-propagate-conversation-threads-from-message-builder-blocked upstream-blocked-message-builder upstream-blocked-conversation-threads)
+(normally r-propagate-gift-wrap-from-message-builder-blocked upstream-blocked-message-builder upstream-blocked-gift-wrap)
+(normally r-propagate-inbox-handler-from-message-builder-blocked upstream-blocked-message-builder upstream-blocked-inbox-handler)
+(normally r-propagate-agent-discovery-from-subscription-manager-blocked upstream-blocked-subscription-manager upstream-blocked-agent-discovery)
+(normally r-propagate-inbox-handler-from-subscription-manager-blocked upstream-blocked-subscription-manager upstream-blocked-inbox-handler)
+(normally r-propagate-reputation-query-from-subscription-manager-blocked upstream-blocked-subscription-manager upstream-blocked-reputation-query)
+(normally r-propagate-spam-prevention-from-subscription-manager-blocked upstream-blocked-subscription-manager upstream-blocked-spam-prevention)
+(normally r-propagate-e2e-scenario-from-open-task-market-blocked upstream-blocked-open-task-market upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-zap-integration-blocked upstream-blocked-zap-integration upstream-blocked-e2e-scenario)
+(normally r-propagate-payment-safety-from-zap-integration-blocked upstream-blocked-zap-integration upstream-blocked-payment-safety)
+(normally r-propagate-reputation-query-from-zap-integration-blocked upstream-blocked-zap-integration upstream-blocked-reputation-query)
+(normally r-propagate-open-task-market-from-agent-discovery-blocked upstream-blocked-agent-discovery upstream-blocked-open-task-market)
+(normally r-propagate-e2e-scenario-from-reputation-query-blocked upstream-blocked-reputation-query upstream-blocked-e2e-scenario)
+(normally r-propagate-payment-safety-from-reputation-query-blocked upstream-blocked-reputation-query upstream-blocked-payment-safety)
+(normally r-propagate-agent-discovery-from-spam-prevention-blocked upstream-blocked-spam-prevention upstream-blocked-agent-discovery)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T03:45:01Z"
+  (given completed-sexpr-codec)
+  (given eval-result-v1-sexpr-codec-by-claude)
+  (given eval-confidence-v1-sexpr-codec-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T03:45:06Z"
+  (given delegated-v1-event-types-to-agent:claude)
+  (given (during (leased-v1-event-types) (moment "2026-03-18T03:45:06Z") (moment "2026-03-18T04:15:06Z")))
+  (given claim-v1-event-types-by-claude)
+  (normally r-cl-state-v1-event-types-by-claude claim-v1-event-types-by-claude state-claimed-v1-event-types-by-claude)
+  (normally r-cl-chain-v1-event-types-by-claude state-claimed-v1-event-types-by-claude claimed-event-types)
+)
+
+;; Propagation rules: failures in 'event-types' block downstream tasks
+(normally r-propagate-differential-tests-from-event-types-failed failed-event-types upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-event-types-permanently-failed permanently-failed-event-types upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-event-types-stale-v1 stale-v1-event-types upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-event-types-timeout-v1 timeout-v1-event-types upstream-blocked-differential-tests)
+(normally r-propagate-differential-tests-from-event-types-blocked upstream-blocked-event-types upstream-blocked-differential-tests)
+(normally r-propagate-event-signing-from-event-types-failed failed-event-types upstream-blocked-event-signing)
+(normally r-propagate-event-signing-from-event-types-permanently-failed permanently-failed-event-types upstream-blocked-event-signing)
+(normally r-propagate-event-signing-from-event-types-stale-v1 stale-v1-event-types upstream-blocked-event-signing)
+(normally r-propagate-event-signing-from-event-types-timeout-v1 timeout-v1-event-types upstream-blocked-event-signing)
+(normally r-propagate-event-signing-from-event-types-blocked upstream-blocked-event-types upstream-blocked-event-signing)
+(normally r-propagate-message-builder-from-event-types-failed failed-event-types upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-event-types-permanently-failed permanently-failed-event-types upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-event-types-stale-v1 stale-v1-event-types upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-event-types-timeout-v1 timeout-v1-event-types upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-event-types-blocked upstream-blocked-event-types upstream-blocked-message-builder)
+(normally r-propagate-performative-tags-from-event-types-failed failed-event-types upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-event-types-permanently-failed permanently-failed-event-types upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-event-types-stale-v1 stale-v1-event-types upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-event-types-timeout-v1 timeout-v1-event-types upstream-blocked-performative-tags)
+(normally r-propagate-performative-tags-from-event-types-blocked upstream-blocked-event-types upstream-blocked-performative-tags)
+(normally r-propagate-relay-pool-from-event-types-failed failed-event-types upstream-blocked-relay-pool)
+(normally r-propagate-relay-pool-from-event-types-permanently-failed permanently-failed-event-types upstream-blocked-relay-pool)
+(normally r-propagate-relay-pool-from-event-types-stale-v1 stale-v1-event-types upstream-blocked-relay-pool)
+(normally r-propagate-relay-pool-from-event-types-timeout-v1 timeout-v1-event-types upstream-blocked-relay-pool)
+(normally r-propagate-relay-pool-from-event-types-blocked upstream-blocked-event-types upstream-blocked-relay-pool)
+
+;; Transitive propagation: upstream-blocked cascades through dependency chain
+(normally r-propagate-agent-profile-from-event-signing-blocked upstream-blocked-event-signing upstream-blocked-agent-profile)
+(normally r-propagate-dialect-negotiation-from-event-signing-blocked upstream-blocked-event-signing upstream-blocked-dialect-negotiation)
+(normally r-propagate-gift-wrap-from-event-signing-blocked upstream-blocked-event-signing upstream-blocked-gift-wrap)
+(normally r-propagate-zap-integration-from-event-signing-blocked upstream-blocked-event-signing upstream-blocked-zap-integration)
+(normally r-propagate-agent-profile-from-relay-pool-blocked upstream-blocked-relay-pool upstream-blocked-agent-profile)
+(normally r-propagate-dialect-negotiation-from-relay-pool-blocked upstream-blocked-relay-pool upstream-blocked-dialect-negotiation)
+(normally r-propagate-spam-prevention-from-relay-pool-blocked upstream-blocked-relay-pool upstream-blocked-spam-prevention)
+(normally r-propagate-subscription-manager-from-relay-pool-blocked upstream-blocked-relay-pool upstream-blocked-subscription-manager)
+(normally r-propagate-agent-discovery-from-agent-profile-blocked upstream-blocked-agent-profile upstream-blocked-agent-discovery)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T03:46:59Z"
+  (given completed-event-types)
+  (given eval-result-v1-event-types-by-claude)
+  (given eval-confidence-v1-event-types-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T03:47:04Z"
+  (given delegated-v1-relay-pool-to-agent:claude)
+  (given (during (leased-v1-relay-pool) (moment "2026-03-18T03:47:04Z") (moment "2026-03-18T04:17:04Z")))
+  (given claim-v1-relay-pool-by-claude)
+  (normally r-cl-state-v1-relay-pool-by-claude claim-v1-relay-pool-by-claude state-claimed-v1-relay-pool-by-claude)
+  (normally r-cl-chain-v1-relay-pool-by-claude state-claimed-v1-relay-pool-by-claude claimed-relay-pool)
+)
+
+;; Propagation rules: failures in 'relay-pool' block downstream tasks
+(normally r-propagate-agent-profile-from-relay-pool-failed failed-relay-pool upstream-blocked-agent-profile)
+(normally r-propagate-agent-profile-from-relay-pool-permanently-failed permanently-failed-relay-pool upstream-blocked-agent-profile)
+(normally r-propagate-agent-profile-from-relay-pool-stale-v1 stale-v1-relay-pool upstream-blocked-agent-profile)
+(normally r-propagate-agent-profile-from-relay-pool-timeout-v1 timeout-v1-relay-pool upstream-blocked-agent-profile)
+(normally r-propagate-dialect-negotiation-from-relay-pool-failed failed-relay-pool upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-relay-pool-permanently-failed permanently-failed-relay-pool upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-relay-pool-stale-v1 stale-v1-relay-pool upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-relay-pool-timeout-v1 timeout-v1-relay-pool upstream-blocked-dialect-negotiation)
+(normally r-propagate-spam-prevention-from-relay-pool-failed failed-relay-pool upstream-blocked-spam-prevention)
+(normally r-propagate-spam-prevention-from-relay-pool-permanently-failed permanently-failed-relay-pool upstream-blocked-spam-prevention)
+(normally r-propagate-spam-prevention-from-relay-pool-stale-v1 stale-v1-relay-pool upstream-blocked-spam-prevention)
+(normally r-propagate-spam-prevention-from-relay-pool-timeout-v1 timeout-v1-relay-pool upstream-blocked-spam-prevention)
+(normally r-propagate-subscription-manager-from-relay-pool-failed failed-relay-pool upstream-blocked-subscription-manager)
+(normally r-propagate-subscription-manager-from-relay-pool-permanently-failed permanently-failed-relay-pool upstream-blocked-subscription-manager)
+(normally r-propagate-subscription-manager-from-relay-pool-stale-v1 stale-v1-relay-pool upstream-blocked-subscription-manager)
+(normally r-propagate-subscription-manager-from-relay-pool-timeout-v1 timeout-v1-relay-pool upstream-blocked-subscription-manager)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T03:52:03Z"
+  (given completed-relay-pool)
+  (given eval-result-v1-relay-pool-by-claude)
+  (given eval-confidence-v1-relay-pool-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T03:52:08Z"
+  (given delegated-v1-differential-tests-to-agent:claude)
+  (given (during (leased-v1-differential-tests) (moment "2026-03-18T03:52:08Z") (moment "2026-03-18T04:22:08Z")))
+  (given claim-v1-differential-tests-by-claude)
+  (normally r-cl-state-v1-differential-tests-by-claude claim-v1-differential-tests-by-claude state-claimed-v1-differential-tests-by-claude)
+  (normally r-cl-chain-v1-differential-tests-by-claude state-claimed-v1-differential-tests-by-claude claimed-differential-tests)
+)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T03:59:32Z"
+  (given completed-differential-tests)
+  (given eval-result-v1-differential-tests-by-claude)
+  (given eval-confidence-v1-differential-tests-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T03:59:37Z"
+  (given delegated-v1-performative-tags-to-agent:claude)
+  (given (during (leased-v1-performative-tags) (moment "2026-03-18T03:59:37Z") (moment "2026-03-18T04:29:37Z")))
+  (given claim-v1-performative-tags-by-claude)
+  (normally r-cl-state-v1-performative-tags-by-claude claim-v1-performative-tags-by-claude state-claimed-v1-performative-tags-by-claude)
+  (normally r-cl-chain-v1-performative-tags-by-claude state-claimed-v1-performative-tags-by-claude claimed-performative-tags)
+)
+
+;; Propagation rules: failures in 'performative-tags' block downstream tasks
+(normally r-propagate-message-builder-from-performative-tags-failed failed-performative-tags upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-performative-tags-permanently-failed permanently-failed-performative-tags upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-performative-tags-stale-v1 stale-v1-performative-tags upstream-blocked-message-builder)
+(normally r-propagate-message-builder-from-performative-tags-timeout-v1 timeout-v1-performative-tags upstream-blocked-message-builder)
+(normally r-propagate-subscription-manager-from-performative-tags-failed failed-performative-tags upstream-blocked-subscription-manager)
+(normally r-propagate-subscription-manager-from-performative-tags-permanently-failed permanently-failed-performative-tags upstream-blocked-subscription-manager)
+(normally r-propagate-subscription-manager-from-performative-tags-stale-v1 stale-v1-performative-tags upstream-blocked-subscription-manager)
+(normally r-propagate-subscription-manager-from-performative-tags-timeout-v1 timeout-v1-performative-tags upstream-blocked-subscription-manager)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:02:29Z"
+  (given completed-performative-tags)
+  (given eval-result-v1-performative-tags-by-claude)
+  (given eval-confidence-v1-performative-tags-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:02:34Z"
+  (given delegated-v1-message-builder-to-agent:claude)
+  (given (during (leased-v1-message-builder) (moment "2026-03-18T04:02:34Z") (moment "2026-03-18T04:32:34Z")))
+  (given claim-v1-message-builder-by-claude)
+  (normally r-cl-state-v1-message-builder-by-claude claim-v1-message-builder-by-claude state-claimed-v1-message-builder-by-claude)
+  (normally r-cl-chain-v1-message-builder-by-claude state-claimed-v1-message-builder-by-claude claimed-message-builder)
+)
+
+;; Propagation rules: failures in 'message-builder' block downstream tasks
+(normally r-propagate-agent-discovery-from-message-builder-failed failed-message-builder upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-message-builder-permanently-failed permanently-failed-message-builder upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-message-builder-stale-v1 stale-v1-message-builder upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-message-builder-timeout-v1 timeout-v1-message-builder upstream-blocked-agent-discovery)
+(normally r-propagate-conversation-threads-from-message-builder-failed failed-message-builder upstream-blocked-conversation-threads)
+(normally r-propagate-conversation-threads-from-message-builder-permanently-failed permanently-failed-message-builder upstream-blocked-conversation-threads)
+(normally r-propagate-conversation-threads-from-message-builder-stale-v1 stale-v1-message-builder upstream-blocked-conversation-threads)
+(normally r-propagate-conversation-threads-from-message-builder-timeout-v1 timeout-v1-message-builder upstream-blocked-conversation-threads)
+(normally r-propagate-gift-wrap-from-message-builder-failed failed-message-builder upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-message-builder-permanently-failed permanently-failed-message-builder upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-message-builder-stale-v1 stale-v1-message-builder upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-message-builder-timeout-v1 timeout-v1-message-builder upstream-blocked-gift-wrap)
+(normally r-propagate-inbox-handler-from-message-builder-failed failed-message-builder upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-message-builder-permanently-failed permanently-failed-message-builder upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-message-builder-stale-v1 stale-v1-message-builder upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-message-builder-timeout-v1 timeout-v1-message-builder upstream-blocked-inbox-handler)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:05:47Z"
+  (given completed-message-builder)
+  (given eval-result-v1-message-builder-by-claude)
+  (given eval-confidence-v1-message-builder-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:05:52Z"
+  (given delegated-v1-event-signing-to-agent:claude)
+  (given (during (leased-v1-event-signing) (moment "2026-03-18T04:05:52Z") (moment "2026-03-18T04:35:52Z")))
+  (given claim-v1-event-signing-by-claude)
+  (normally r-cl-state-v1-event-signing-by-claude claim-v1-event-signing-by-claude state-claimed-v1-event-signing-by-claude)
+  (normally r-cl-chain-v1-event-signing-by-claude state-claimed-v1-event-signing-by-claude claimed-event-signing)
+)
+
+;; Propagation rules: failures in 'event-signing' block downstream tasks
+(normally r-propagate-agent-profile-from-event-signing-failed failed-event-signing upstream-blocked-agent-profile)
+(normally r-propagate-agent-profile-from-event-signing-permanently-failed permanently-failed-event-signing upstream-blocked-agent-profile)
+(normally r-propagate-agent-profile-from-event-signing-stale-v1 stale-v1-event-signing upstream-blocked-agent-profile)
+(normally r-propagate-agent-profile-from-event-signing-timeout-v1 timeout-v1-event-signing upstream-blocked-agent-profile)
+(normally r-propagate-dialect-negotiation-from-event-signing-failed failed-event-signing upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-event-signing-permanently-failed permanently-failed-event-signing upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-event-signing-stale-v1 stale-v1-event-signing upstream-blocked-dialect-negotiation)
+(normally r-propagate-dialect-negotiation-from-event-signing-timeout-v1 timeout-v1-event-signing upstream-blocked-dialect-negotiation)
+(normally r-propagate-gift-wrap-from-event-signing-failed failed-event-signing upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-event-signing-permanently-failed permanently-failed-event-signing upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-event-signing-stale-v1 stale-v1-event-signing upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-event-signing-timeout-v1 timeout-v1-event-signing upstream-blocked-gift-wrap)
+(normally r-propagate-zap-integration-from-event-signing-failed failed-event-signing upstream-blocked-zap-integration)
+(normally r-propagate-zap-integration-from-event-signing-permanently-failed permanently-failed-event-signing upstream-blocked-zap-integration)
+(normally r-propagate-zap-integration-from-event-signing-stale-v1 stale-v1-event-signing upstream-blocked-zap-integration)
+(normally r-propagate-zap-integration-from-event-signing-timeout-v1 timeout-v1-event-signing upstream-blocked-zap-integration)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:12:03Z"
+  (given completed-event-signing)
+  (given eval-result-v1-event-signing-by-claude)
+  (given eval-confidence-v1-event-signing-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:12:09Z"
+  (given delegated-v1-dialect-negotiation-to-agent:claude)
+  (given (during (leased-v1-dialect-negotiation) (moment "2026-03-18T04:12:09Z") (moment "2026-03-18T04:42:09Z")))
+  (given claim-v1-dialect-negotiation-by-claude)
+  (normally r-cl-state-v1-dialect-negotiation-by-claude claim-v1-dialect-negotiation-by-claude state-claimed-v1-dialect-negotiation-by-claude)
+  (normally r-cl-chain-v1-dialect-negotiation-by-claude state-claimed-v1-dialect-negotiation-by-claude claimed-dialect-negotiation)
+)
+
+;; Propagation rules: failures in 'dialect-negotiation' block downstream tasks
+(normally r-propagate-commerce-dialect-from-dialect-negotiation-failed failed-dialect-negotiation upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-dialect-negotiation-permanently-failed permanently-failed-dialect-negotiation upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-dialect-negotiation-stale-v1 stale-v1-dialect-negotiation upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-dialect-negotiation-timeout-v1 timeout-v1-dialect-negotiation upstream-blocked-commerce-dialect)
+(normally r-propagate-dialect-safety-from-dialect-negotiation-failed failed-dialect-negotiation upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-dialect-negotiation-permanently-failed permanently-failed-dialect-negotiation upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-dialect-negotiation-stale-v1 stale-v1-dialect-negotiation upstream-blocked-dialect-safety)
+(normally r-propagate-dialect-safety-from-dialect-negotiation-timeout-v1 timeout-v1-dialect-negotiation upstream-blocked-dialect-safety)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:18:22Z"
+  (given completed-dialect-negotiation)
+  (given eval-result-v1-dialect-negotiation-by-claude)
+  (given eval-confidence-v1-dialect-negotiation-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:18:27Z"
+  (given delegated-v1-agent-profile-to-agent:claude)
+  (given (during (leased-v1-agent-profile) (moment "2026-03-18T04:18:27Z") (moment "2026-03-18T04:48:27Z")))
+  (given claim-v1-agent-profile-by-claude)
+  (normally r-cl-state-v1-agent-profile-by-claude claim-v1-agent-profile-by-claude state-claimed-v1-agent-profile-by-claude)
+  (normally r-cl-chain-v1-agent-profile-by-claude state-claimed-v1-agent-profile-by-claude claimed-agent-profile)
+)
+
+;; Propagation rules: failures in 'agent-profile' block downstream tasks
+(normally r-propagate-agent-discovery-from-agent-profile-failed failed-agent-profile upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-agent-profile-permanently-failed permanently-failed-agent-profile upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-agent-profile-stale-v1 stale-v1-agent-profile upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-agent-profile-timeout-v1 timeout-v1-agent-profile upstream-blocked-agent-discovery)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:22:15Z"
+  (given completed-agent-profile)
+  (given eval-result-v1-agent-profile-by-claude)
+  (given eval-confidence-v1-agent-profile-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:22:20Z"
+  (given delegated-v1-dialect-safety-to-agent:claude)
+  (given (during (leased-v1-dialect-safety) (moment "2026-03-18T04:22:20Z") (moment "2026-03-18T04:52:20Z")))
+  (given claim-v1-dialect-safety-by-claude)
+  (normally r-cl-state-v1-dialect-safety-by-claude claim-v1-dialect-safety-by-claude state-claimed-v1-dialect-safety-by-claude)
+  (normally r-cl-chain-v1-dialect-safety-by-claude state-claimed-v1-dialect-safety-by-claude claimed-dialect-safety)
+)
+
+;; Propagation rules: failures in 'dialect-safety' block downstream tasks
+(normally r-propagate-commerce-dialect-from-dialect-safety-failed failed-dialect-safety upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-dialect-safety-permanently-failed permanently-failed-dialect-safety upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-dialect-safety-stale-v1 stale-v1-dialect-safety upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-dialect-safety-timeout-v1 timeout-v1-dialect-safety upstream-blocked-commerce-dialect)
+(normally r-propagate-integration-tests-from-dialect-safety-failed failed-dialect-safety upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-dialect-safety-permanently-failed permanently-failed-dialect-safety upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-dialect-safety-stale-v1 stale-v1-dialect-safety upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-dialect-safety-timeout-v1 timeout-v1-dialect-safety upstream-blocked-integration-tests)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:28:59Z"
+  (given completed-dialect-safety)
+  (given eval-result-v1-dialect-safety-by-claude)
+  (given eval-confidence-v1-dialect-safety-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:29:04Z"
+  (given delegated-v1-subscription-manager-to-agent:claude)
+  (given (during (leased-v1-subscription-manager) (moment "2026-03-18T04:29:04Z") (moment "2026-03-18T04:59:04Z")))
+  (given claim-v1-subscription-manager-by-claude)
+  (normally r-cl-state-v1-subscription-manager-by-claude claim-v1-subscription-manager-by-claude state-claimed-v1-subscription-manager-by-claude)
+  (normally r-cl-chain-v1-subscription-manager-by-claude state-claimed-v1-subscription-manager-by-claude claimed-subscription-manager)
+)
+
+;; Propagation rules: failures in 'subscription-manager' block downstream tasks
+(normally r-propagate-agent-discovery-from-subscription-manager-failed failed-subscription-manager upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-subscription-manager-permanently-failed permanently-failed-subscription-manager upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-subscription-manager-stale-v1 stale-v1-subscription-manager upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-subscription-manager-timeout-v1 timeout-v1-subscription-manager upstream-blocked-agent-discovery)
+(normally r-propagate-inbox-handler-from-subscription-manager-failed failed-subscription-manager upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-subscription-manager-permanently-failed permanently-failed-subscription-manager upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-subscription-manager-stale-v1 stale-v1-subscription-manager upstream-blocked-inbox-handler)
+(normally r-propagate-inbox-handler-from-subscription-manager-timeout-v1 timeout-v1-subscription-manager upstream-blocked-inbox-handler)
+(normally r-propagate-reputation-query-from-subscription-manager-failed failed-subscription-manager upstream-blocked-reputation-query)
+(normally r-propagate-reputation-query-from-subscription-manager-permanently-failed permanently-failed-subscription-manager upstream-blocked-reputation-query)
+(normally r-propagate-reputation-query-from-subscription-manager-stale-v1 stale-v1-subscription-manager upstream-blocked-reputation-query)
+(normally r-propagate-reputation-query-from-subscription-manager-timeout-v1 timeout-v1-subscription-manager upstream-blocked-reputation-query)
+(normally r-propagate-spam-prevention-from-subscription-manager-failed failed-subscription-manager upstream-blocked-spam-prevention)
+(normally r-propagate-spam-prevention-from-subscription-manager-permanently-failed permanently-failed-subscription-manager upstream-blocked-spam-prevention)
+(normally r-propagate-spam-prevention-from-subscription-manager-stale-v1 stale-v1-subscription-manager upstream-blocked-spam-prevention)
+(normally r-propagate-spam-prevention-from-subscription-manager-timeout-v1 timeout-v1-subscription-manager upstream-blocked-spam-prevention)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:33:54Z"
+  (given completed-subscription-manager)
+  (given eval-result-v1-subscription-manager-by-claude)
+  (given eval-confidence-v1-subscription-manager-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:34:00Z"
+  (given delegated-v1-spam-prevention-to-agent:claude)
+  (given (during (leased-v1-spam-prevention) (moment "2026-03-18T04:34:00Z") (moment "2026-03-18T05:04:00Z")))
+  (given claim-v1-spam-prevention-by-claude)
+  (normally r-cl-state-v1-spam-prevention-by-claude claim-v1-spam-prevention-by-claude state-claimed-v1-spam-prevention-by-claude)
+  (normally r-cl-chain-v1-spam-prevention-by-claude state-claimed-v1-spam-prevention-by-claude claimed-spam-prevention)
+)
+
+;; Propagation rules: failures in 'spam-prevention' block downstream tasks
+(normally r-propagate-agent-discovery-from-spam-prevention-failed failed-spam-prevention upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-spam-prevention-permanently-failed permanently-failed-spam-prevention upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-spam-prevention-stale-v1 stale-v1-spam-prevention upstream-blocked-agent-discovery)
+(normally r-propagate-agent-discovery-from-spam-prevention-timeout-v1 timeout-v1-spam-prevention upstream-blocked-agent-discovery)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:38:17Z"
+  (given completed-spam-prevention)
+  (given eval-result-v1-spam-prevention-by-claude)
+  (given eval-confidence-v1-spam-prevention-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:38:22Z"
+  (given delegated-v1-inbox-handler-to-agent:claude)
+  (given (during (leased-v1-inbox-handler) (moment "2026-03-18T04:38:22Z") (moment "2026-03-18T05:08:22Z")))
+  (given claim-v1-inbox-handler-by-claude)
+  (normally r-cl-state-v1-inbox-handler-by-claude claim-v1-inbox-handler-by-claude state-claimed-v1-inbox-handler-by-claude)
+  (normally r-cl-chain-v1-inbox-handler-by-claude state-claimed-v1-inbox-handler-by-claude claimed-inbox-handler)
+)
+
+;; Propagation rules: failures in 'inbox-handler' block downstream tasks
+(normally r-propagate-conversation-threads-from-inbox-handler-failed failed-inbox-handler upstream-blocked-conversation-threads)
+(normally r-propagate-conversation-threads-from-inbox-handler-permanently-failed permanently-failed-inbox-handler upstream-blocked-conversation-threads)
+(normally r-propagate-conversation-threads-from-inbox-handler-stale-v1 stale-v1-inbox-handler upstream-blocked-conversation-threads)
+(normally r-propagate-conversation-threads-from-inbox-handler-timeout-v1 timeout-v1-inbox-handler upstream-blocked-conversation-threads)
+(normally r-propagate-gift-wrap-from-inbox-handler-failed failed-inbox-handler upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-inbox-handler-permanently-failed permanently-failed-inbox-handler upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-inbox-handler-stale-v1 stale-v1-inbox-handler upstream-blocked-gift-wrap)
+(normally r-propagate-gift-wrap-from-inbox-handler-timeout-v1 timeout-v1-inbox-handler upstream-blocked-gift-wrap)
+(normally r-propagate-integration-tests-from-inbox-handler-failed failed-inbox-handler upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-inbox-handler-permanently-failed permanently-failed-inbox-handler upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-inbox-handler-stale-v1 stale-v1-inbox-handler upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-inbox-handler-timeout-v1 timeout-v1-inbox-handler upstream-blocked-integration-tests)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:43:26Z"
+  (given completed-inbox-handler)
+  (given eval-result-v1-inbox-handler-by-claude)
+  (given eval-confidence-v1-inbox-handler-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:43:32Z"
+  (given delegated-v1-conversation-threads-to-agent:claude)
+  (given (during (leased-v1-conversation-threads) (moment "2026-03-18T04:43:32Z") (moment "2026-03-18T05:13:32Z")))
+  (given claim-v1-conversation-threads-by-claude)
+  (normally r-cl-state-v1-conversation-threads-by-claude claim-v1-conversation-threads-by-claude state-claimed-v1-conversation-threads-by-claude)
+  (normally r-cl-chain-v1-conversation-threads-by-claude state-claimed-v1-conversation-threads-by-claude claimed-conversation-threads)
+)
+
+;; Propagation rules: failures in 'conversation-threads' block downstream tasks
+(normally r-propagate-commerce-dialect-from-conversation-threads-failed failed-conversation-threads upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-conversation-threads-permanently-failed permanently-failed-conversation-threads upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-conversation-threads-stale-v1 stale-v1-conversation-threads upstream-blocked-commerce-dialect)
+(normally r-propagate-commerce-dialect-from-conversation-threads-timeout-v1 timeout-v1-conversation-threads upstream-blocked-commerce-dialect)
+(normally r-propagate-integration-tests-from-conversation-threads-failed failed-conversation-threads upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-conversation-threads-permanently-failed permanently-failed-conversation-threads upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-conversation-threads-stale-v1 stale-v1-conversation-threads upstream-blocked-integration-tests)
+(normally r-propagate-integration-tests-from-conversation-threads-timeout-v1 timeout-v1-conversation-threads upstream-blocked-integration-tests)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:47:38Z"
+  (given completed-conversation-threads)
+  (given eval-result-v1-conversation-threads-by-claude)
+  (given eval-confidence-v1-conversation-threads-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:47:44Z"
+  (given delegated-v1-commerce-dialect-to-agent:claude)
+  (given (during (leased-v1-commerce-dialect) (moment "2026-03-18T04:47:44Z") (moment "2026-03-18T05:17:44Z")))
+  (given claim-v1-commerce-dialect-by-claude)
+  (normally r-cl-state-v1-commerce-dialect-by-claude claim-v1-commerce-dialect-by-claude state-claimed-v1-commerce-dialect-by-claude)
+  (normally r-cl-chain-v1-commerce-dialect-by-claude state-claimed-v1-commerce-dialect-by-claude claimed-commerce-dialect)
+)
+
+;; Propagation rules: failures in 'commerce-dialect' block downstream tasks
+(normally r-propagate-open-task-market-from-commerce-dialect-failed failed-commerce-dialect upstream-blocked-open-task-market)
+(normally r-propagate-open-task-market-from-commerce-dialect-permanently-failed permanently-failed-commerce-dialect upstream-blocked-open-task-market)
+(normally r-propagate-open-task-market-from-commerce-dialect-stale-v1 stale-v1-commerce-dialect upstream-blocked-open-task-market)
+(normally r-propagate-open-task-market-from-commerce-dialect-timeout-v1 timeout-v1-commerce-dialect upstream-blocked-open-task-market)
+(normally r-propagate-zap-integration-from-commerce-dialect-failed failed-commerce-dialect upstream-blocked-zap-integration)
+(normally r-propagate-zap-integration-from-commerce-dialect-permanently-failed permanently-failed-commerce-dialect upstream-blocked-zap-integration)
+(normally r-propagate-zap-integration-from-commerce-dialect-stale-v1 stale-v1-commerce-dialect upstream-blocked-zap-integration)
+(normally r-propagate-zap-integration-from-commerce-dialect-timeout-v1 timeout-v1-commerce-dialect upstream-blocked-zap-integration)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:53:04Z"
+  (given completed-commerce-dialect)
+  (given eval-result-v1-commerce-dialect-by-claude)
+  (given eval-confidence-v1-commerce-dialect-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:53:10Z"
+  (given delegated-v1-zap-integration-to-agent:claude)
+  (given (during (leased-v1-zap-integration) (moment "2026-03-18T04:53:10Z") (moment "2026-03-18T05:23:10Z")))
+  (given claim-v1-zap-integration-by-claude)
+  (normally r-cl-state-v1-zap-integration-by-claude claim-v1-zap-integration-by-claude state-claimed-v1-zap-integration-by-claude)
+  (normally r-cl-chain-v1-zap-integration-by-claude state-claimed-v1-zap-integration-by-claude claimed-zap-integration)
+)
+
+;; Propagation rules: failures in 'zap-integration' block downstream tasks
+(normally r-propagate-e2e-scenario-from-zap-integration-failed failed-zap-integration upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-zap-integration-permanently-failed permanently-failed-zap-integration upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-zap-integration-stale-v1 stale-v1-zap-integration upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-zap-integration-timeout-v1 timeout-v1-zap-integration upstream-blocked-e2e-scenario)
+(normally r-propagate-payment-safety-from-zap-integration-failed failed-zap-integration upstream-blocked-payment-safety)
+(normally r-propagate-payment-safety-from-zap-integration-permanently-failed permanently-failed-zap-integration upstream-blocked-payment-safety)
+(normally r-propagate-payment-safety-from-zap-integration-stale-v1 stale-v1-zap-integration upstream-blocked-payment-safety)
+(normally r-propagate-payment-safety-from-zap-integration-timeout-v1 timeout-v1-zap-integration upstream-blocked-payment-safety)
+(normally r-propagate-reputation-query-from-zap-integration-failed failed-zap-integration upstream-blocked-reputation-query)
+(normally r-propagate-reputation-query-from-zap-integration-permanently-failed permanently-failed-zap-integration upstream-blocked-reputation-query)
+(normally r-propagate-reputation-query-from-zap-integration-stale-v1 stale-v1-zap-integration upstream-blocked-reputation-query)
+(normally r-propagate-reputation-query-from-zap-integration-timeout-v1 timeout-v1-zap-integration upstream-blocked-reputation-query)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T04:57:14Z"
+  (given completed-zap-integration)
+  (given eval-result-v1-zap-integration-by-claude)
+  (given eval-confidence-v1-zap-integration-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T04:57:19Z"
+  (given delegated-v1-gift-wrap-to-agent:claude)
+  (given (during (leased-v1-gift-wrap) (moment "2026-03-18T04:57:19Z") (moment "2026-03-18T05:27:19Z")))
+  (given claim-v1-gift-wrap-by-claude)
+  (normally r-cl-state-v1-gift-wrap-by-claude claim-v1-gift-wrap-by-claude state-claimed-v1-gift-wrap-by-claude)
+  (normally r-cl-chain-v1-gift-wrap-by-claude state-claimed-v1-gift-wrap-by-claude claimed-gift-wrap)
+)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:01:02Z"
+  (given completed-gift-wrap)
+  (given eval-result-v1-gift-wrap-by-claude)
+  (given eval-confidence-v1-gift-wrap-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T05:01:08Z"
+  (given delegated-v1-agent-discovery-to-agent:claude)
+  (given (during (leased-v1-agent-discovery) (moment "2026-03-18T05:01:08Z") (moment "2026-03-18T05:31:08Z")))
+  (given claim-v1-agent-discovery-by-claude)
+  (normally r-cl-state-v1-agent-discovery-by-claude claim-v1-agent-discovery-by-claude state-claimed-v1-agent-discovery-by-claude)
+  (normally r-cl-chain-v1-agent-discovery-by-claude state-claimed-v1-agent-discovery-by-claude claimed-agent-discovery)
+)
+
+;; Propagation rules: failures in 'agent-discovery' block downstream tasks
+(normally r-propagate-open-task-market-from-agent-discovery-failed failed-agent-discovery upstream-blocked-open-task-market)
+(normally r-propagate-open-task-market-from-agent-discovery-permanently-failed permanently-failed-agent-discovery upstream-blocked-open-task-market)
+(normally r-propagate-open-task-market-from-agent-discovery-stale-v1 stale-v1-agent-discovery upstream-blocked-open-task-market)
+(normally r-propagate-open-task-market-from-agent-discovery-timeout-v1 timeout-v1-agent-discovery upstream-blocked-open-task-market)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:04:17Z"
+  (given completed-agent-discovery)
+  (given eval-result-v1-agent-discovery-by-claude)
+  (given eval-confidence-v1-agent-discovery-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T05:04:23Z"
+  (given delegated-v1-open-task-market-to-agent:claude)
+  (given (during (leased-v1-open-task-market) (moment "2026-03-18T05:04:23Z") (moment "2026-03-18T05:34:23Z")))
+  (given claim-v1-open-task-market-by-claude)
+  (normally r-cl-state-v1-open-task-market-by-claude claim-v1-open-task-market-by-claude state-claimed-v1-open-task-market-by-claude)
+  (normally r-cl-chain-v1-open-task-market-by-claude state-claimed-v1-open-task-market-by-claude claimed-open-task-market)
+)
+
+;; Propagation rules: failures in 'open-task-market' block downstream tasks
+(normally r-propagate-e2e-scenario-from-open-task-market-failed failed-open-task-market upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-open-task-market-permanently-failed permanently-failed-open-task-market upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-open-task-market-stale-v1 stale-v1-open-task-market upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-open-task-market-timeout-v1 timeout-v1-open-task-market upstream-blocked-e2e-scenario)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:10:16Z"
+  (given completed-open-task-market)
+  (given eval-result-v1-open-task-market-by-claude)
+  (given eval-confidence-v1-open-task-market-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T05:10:22Z"
+  (given delegated-v1-integration-tests-to-agent:claude)
+  (given (during (leased-v1-integration-tests) (moment "2026-03-18T05:10:22Z") (moment "2026-03-18T05:40:22Z")))
+  (given claim-v1-integration-tests-by-claude)
+  (normally r-cl-state-v1-integration-tests-by-claude claim-v1-integration-tests-by-claude state-claimed-v1-integration-tests-by-claude)
+  (normally r-cl-chain-v1-integration-tests-by-claude state-claimed-v1-integration-tests-by-claude claimed-integration-tests)
+)
+
+;; Propagation rules: failures in 'integration-tests' block downstream tasks
+(normally r-propagate-e2e-scenario-from-integration-tests-failed failed-integration-tests upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-integration-tests-permanently-failed permanently-failed-integration-tests upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-integration-tests-stale-v1 stale-v1-integration-tests upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-integration-tests-timeout-v1 timeout-v1-integration-tests upstream-blocked-e2e-scenario)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:16:36Z"
+  (given completed-integration-tests)
+  (given eval-result-v1-integration-tests-by-claude)
+  (given eval-confidence-v1-integration-tests-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T05:16:42Z"
+  (given delegated-v1-reputation-query-to-agent:claude)
+  (given (during (leased-v1-reputation-query) (moment "2026-03-18T05:16:42Z") (moment "2026-03-18T05:46:42Z")))
+  (given claim-v1-reputation-query-by-claude)
+  (normally r-cl-state-v1-reputation-query-by-claude claim-v1-reputation-query-by-claude state-claimed-v1-reputation-query-by-claude)
+  (normally r-cl-chain-v1-reputation-query-by-claude state-claimed-v1-reputation-query-by-claude claimed-reputation-query)
+)
+
+;; Propagation rules: failures in 'reputation-query' block downstream tasks
+(normally r-propagate-e2e-scenario-from-reputation-query-failed failed-reputation-query upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-reputation-query-permanently-failed permanently-failed-reputation-query upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-reputation-query-stale-v1 stale-v1-reputation-query upstream-blocked-e2e-scenario)
+(normally r-propagate-e2e-scenario-from-reputation-query-timeout-v1 timeout-v1-reputation-query upstream-blocked-e2e-scenario)
+(normally r-propagate-payment-safety-from-reputation-query-failed failed-reputation-query upstream-blocked-payment-safety)
+(normally r-propagate-payment-safety-from-reputation-query-permanently-failed permanently-failed-reputation-query upstream-blocked-payment-safety)
+(normally r-propagate-payment-safety-from-reputation-query-stale-v1 stale-v1-reputation-query upstream-blocked-payment-safety)
+(normally r-propagate-payment-safety-from-reputation-query-timeout-v1 timeout-v1-reputation-query upstream-blocked-payment-safety)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:22:46Z"
+  (given completed-reputation-query)
+  (given eval-result-v1-reputation-query-by-claude)
+  (given eval-confidence-v1-reputation-query-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T05:22:52Z"
+  (given delegated-v1-payment-safety-to-agent:claude)
+  (given (during (leased-v1-payment-safety) (moment "2026-03-18T05:22:52Z") (moment "2026-03-18T05:52:52Z")))
+  (given claim-v1-payment-safety-by-claude)
+  (normally r-cl-state-v1-payment-safety-by-claude claim-v1-payment-safety-by-claude state-claimed-v1-payment-safety-by-claude)
+  (normally r-cl-chain-v1-payment-safety-by-claude state-claimed-v1-payment-safety-by-claude claimed-payment-safety)
+)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:28:36Z"
+  (given completed-payment-safety)
+  (given eval-result-v1-payment-safety-by-claude)
+  (given eval-confidence-v1-payment-safety-1.00)
+)
+
+(claims supervisor:ed25519:xfRAzZFG
+  :at "2026-03-18T05:28:43Z"
+  (given delegated-v1-e2e-scenario-to-agent:claude)
+  (given (during (leased-v1-e2e-scenario) (moment "2026-03-18T05:28:43Z") (moment "2026-03-18T05:58:43Z")))
+  (given claim-v1-e2e-scenario-by-claude)
+  (normally r-cl-state-v1-e2e-scenario-by-claude claim-v1-e2e-scenario-by-claude state-claimed-v1-e2e-scenario-by-claude)
+  (normally r-cl-chain-v1-e2e-scenario-by-claude state-claimed-v1-e2e-scenario-by-claude claimed-e2e-scenario)
+)
+
+(claims evaluator:ed25519:3jB3fzQT
+  :at "2026-03-18T05:38:48Z"
+  (given completed-e2e-scenario)
+  (given eval-result-v1-e2e-scenario-by-claude)
+  (given eval-confidence-v1-e2e-scenario-1.00)
+)

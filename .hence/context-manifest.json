@@ -1,0 +1,75 @@
+{
+  "task_id": "e2e-scenario",
+  "token_budget": 8000,
+  "tokens_used": 403,
+  "elements_selected": [
+    {
+      "source": "plan-meta/description",
+      "content": "End-to-end scenario: two agents discover each other, negotiate a commerce dialect, publish an open task with bounty, claim it, negotiate price, complete work, invoice, and pay via Lightning zap. Full NIP-XX happy path in a single test.",
+      "token_cost": 58,
+      "priority": "PlanMeta"
+    },
+    {
+      "source": "memory/episodic/task-integration-tests-changes",
+      "content": "Modified 2 files (+981, -9): .hence/context-manifest.json, crates/cbcl-nostr/tests/integration.rs",
+      "token_cost": 24,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-differential-tests-changes",
+      "content": "Modified 2 files (+734, -5): .hence/context-manifest.json, crates/cbcl-nostr/tests/differential.rs",
+      "token_cost": 24,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-sexpr-codec-changes",
+      "content": "Modified 4 files (+562, -0): .hence/context-manifest.json, crates/cbcl-nostr/Cargo.toml, crates/cbcl-nostr/src/lib.rs, crates/cbcl-nostr/src/sexpr_codec.rs",
+      "token_cost": 38,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-event-types-changes",
+      "content": "Modified 3 files (+447, -7): .hence/context-manifest.json, crates/cbcl-nostr/src/event_types.rs, crates/cbcl-nostr/src/lib.rs",
+      "token_cost": 31,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-relay-pool-changes",
+      "content": "Modified 7 files (+1906, -5): .hence/context-manifest.json, crates/cbcl-nostr/Cargo.lock, crates/cbcl-nostr/Cargo.toml, crates/cbcl-nostr/src/lib.rs, crates/cbcl-nostr/src/relay_pool/message.rs and 2 more",
+      "token_cost": 51,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-performative-tags-changes",
+      "content": "Modified 2 files (+254, -5): .hence/context-manifest.json, crates/cbcl-nostr/src/event_types.rs",
+      "token_cost": 23,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-message-builder-changes",
+      "content": "Modified 3 files (+403, -5): .hence/context-manifest.json, crates/cbcl-nostr/src/lib.rs, crates/cbcl-nostr/src/message_builder.rs",
+      "token_cost": 32,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-event-signing-changes",
+      "content": "Modified 5 files (+899, -12): .hence/context-manifest.json, crates/cbcl-nostr/Cargo.lock, crates/cbcl-nostr/Cargo.toml, crates/cbcl-nostr/src/event_signing.rs, crates/cbcl-nostr/src/lib.rs",
+      "token_cost": 47,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-dialect-negotiation-changes",
+      "content": "Modified 4 files (+765, -5): .hence/context-manifest.json, crates/cbcl-nostr/src/dialect_negotiation.rs, crates/cbcl-nostr/src/lib.rs, crates/cbcl-nostr/src/relay_pool/message.rs",
+      "token_cost": 44,
+      "priority": "AgentMemory"
+    },
+    {
+      "source": "memory/episodic/task-agent-profile-changes",
+      "content": "Modified 3 files (+517, -5): .hence/context-manifest.json, crates/cbcl-nostr/src/agent_profile.rs, crates/cbcl-nostr/src/lib.rs",
+      "token_cost": 31,
+      "priority": "AgentMemory"
+    }
+  ],
+  "elements_excluded": [],
+  "constructed_at": "2026-03-18T05:29:02Z"
+}

@@ -1,0 +1,27 @@
+{
+  "recommended_status": "completed",
+  "confidence": 1.0,
+  "exit_code": 0,
+  "diff_summary": {
+    "files_changed": 2,
+    "insertions": 809,
+    "deletions": 5,
+    "file_list": [
+      ".hence/context-manifest.json",
+      "crates/cbcl-nostr/tests/e2e_scenario.rs"
+    ],
+    "dirty_files": 1756
+  },
+  "learnings": [
+    {
+      "key": "task-e2e-scenario-changes",
+      "content": "Modified 2 files (+809, -5): .hence/context-manifest.json, crates/cbcl-nostr/tests/e2e_scenario.rs",
+      "memory_type": "episodic",
+      "confidence": 0.8
+    }
+  ],
+  "branch_name": "hence/e2e-scenario-v1",
+  "evaluated_at": "2026-03-18T05:38:42Z",
+  "checks_passed": 0,
+  "checks_failed": 0
+}
