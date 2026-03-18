@@ -7,8 +7,10 @@ rust-version = "1.75.0"
 license = "Apache-2.0"
 
 [features]
-default = ["std"]
+default = ["std", "relay"]
 std = ["cbcl-core/std", "cbcl-parser/std"]
+relay = ["tokio", "tokio-tungstenite", "futures-util"]
+wasm = ["getrandom/js", "web-time"]
 
 [dependencies]
 cbcl-core = { path = "/Users/anuna-02/Code/cbcl-rs/crates/cbcl-core", default-features = false }
@@ -16,19 +18,25 @@ cbcl-parser = { path = "/Users/anuna-02/Code/cbcl-rs/crates/cbcl-parser", defaul
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
-futures-util = "0.3"
 url = "2"
 tracing = "0.1"
-secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+k256 = { version = "0.13", features = ["ecdh", "schnorr"] }
 sha2 = "0.10"
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 chacha20poly1305 = "0.10"
-rand = "0.8"
+getrandom = "0.2"
 base64 = "0.22"
+
+# Optional: relay pool (native only)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"], optional = true }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# Optional: WASM time support
+web-time = { version = "1", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

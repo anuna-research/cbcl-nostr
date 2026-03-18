@@ -17,7 +17,7 @@
 
 #![forbid(unsafe_code)]
 
-use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+use k256::schnorr::SigningKey;
 
 use crate::event_signing::{
     conversation_key, nip44_decrypt, nip44_encrypt, sign_event, verify_event, Nip44Error,
@@ -66,9 +66,9 @@ pub enum GiftWrapError {
     #[error("hex error: {0}")]
     Hex(#[from] hex::FromHexError),
 
-    /// secp256k1 key operation failed.
-    #[error("secp256k1 error: {0}")]
-    Secp256k1(#[from] secp256k1::Error),
+    /// Cryptographic operation failed.
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -96,12 +96,10 @@ pub fn gift_wrap(
     now: u64,
 ) -> Result<Event, GiftWrapError> {
     // Derive sender pubkey
-    let secp = Secp256k1::new();
     let sk_bytes = hex::decode(sender_secret_key_hex)?;
-    let sk = secp256k1::SecretKey::from_slice(&sk_bytes)?;
-    let keypair = Keypair::from_secret_key(&secp, &sk);
-    let (sender_xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
-    let sender_pubkey_hex = hex::encode(sender_xonly.serialize());
+    let signing_key = SigningKey::from_bytes(&sk_bytes)
+        .map_err(|e| GiftWrapError::Crypto(e.to_string()))?;
+    let sender_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
     // Step 1: Prepare the rumor (unsigned inner event)
     rumor.pubkey = sender_pubkey_hex;
@@ -128,8 +126,7 @@ pub fn gift_wrap(
     sign_event(&mut seal, sender_secret_key_hex, now)?;
 
     // Step 3: Create the gift wrap (kind 1059) with ephemeral key
-    let ephemeral_sk = generate_ephemeral_key();
-    let ephemeral_sk_hex = hex::encode(&ephemeral_sk);
+    let ephemeral_sk_hex = generate_ephemeral_key_hex();
 
     let ephemeral_recipient_ck = conversation_key(&ephemeral_sk_hex, recipient_pubkey_hex)?;
     let seal_json = serde_json::to_string(&seal)?;
@@ -221,29 +218,25 @@ pub fn unwrap_gift(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a random 32-byte ephemeral secret key.
-fn generate_ephemeral_key() -> [u8; 32] {
-    use rand::RngCore;
-    let secp = Secp256k1::new();
+/// Generate a random 32-byte ephemeral secret key as hex.
+fn generate_ephemeral_key_hex() -> String {
+    let mut bytes = [0u8; 32];
     loop {
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        // Ensure it's a valid secp256k1 secret key
-        if secp256k1::SecretKey::from_slice(&bytes).is_ok() {
-            // Verify we can derive a valid keypair
-            let sk = secp256k1::SecretKey::from_slice(&bytes).unwrap();
-            let _ = Keypair::from_secret_key(&secp, &sk);
-            return bytes;
+        ::getrandom::getrandom(&mut bytes).expect("getrandom failed");
+        if SigningKey::from_bytes(&bytes).is_ok() {
+            return hex::encode(bytes);
         }
     }
 }
 
 /// Apply random jitter to a timestamp (±TIMESTAMP_JITTER_SECS).
 fn randomize_timestamp(now: u64) -> u64 {
-    use rand::Rng;
-    let jitter: i64 = rand::thread_rng().gen_range(
-        -(TIMESTAMP_JITTER_SECS as i64)..=(TIMESTAMP_JITTER_SECS as i64),
-    );
+    let mut buf = [0u8; 8];
+    ::getrandom::getrandom(&mut buf).expect("getrandom failed");
+    let raw = u64::from_le_bytes(buf);
+    // Map to range [0, 2*JITTER] then shift to [-JITTER, +JITTER]
+    let range = 2 * TIMESTAMP_JITTER_SECS + 1;
+    let jitter = (raw % range) as i64 - TIMESTAMP_JITTER_SECS as i64;
     (now as i64 + jitter).max(0) as u64
 }
 
@@ -254,18 +247,11 @@ fn randomize_timestamp(now: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_signing::generate_keypair;
     use crate::event_types::{KIND_AGENT_DIALECT, KIND_AGENT_MESSAGE};
 
-    /// Generate a fresh keypair, returning (secret_key_hex, pubkey_hex).
     fn gen_keypair() -> (String, String) {
-        let secp = Secp256k1::new();
-        let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
-        let keypair = Keypair::from_secret_key(&secp, &sk);
-        let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
-        (
-            hex::encode(sk.secret_bytes()),
-            hex::encode(xonly.serialize()),
-        )
+        generate_keypair()
     }
 
     fn make_rumor(kind: u64, content: &str, tags: Vec<Vec<String>>) -> Event {

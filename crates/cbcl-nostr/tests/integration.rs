@@ -30,8 +30,6 @@ use cbcl_nostr::inbox_handler::{InboxHandler, PerformativeKind};
 use cbcl_nostr::message_builder::MessageBuilder;
 use cbcl_nostr::relay_pool::{Filter, PoolConfig, RelayPool, RelayMessage, SubscriptionId};
 
-use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -41,16 +39,9 @@ fn relay_url() -> String {
     std::env::var("NOSTR_TEST_RELAY").unwrap_or_else(|_| "ws://localhost:8080".into())
 }
 
-/// Generate a fresh secp256k1 keypair → (secret_key_hex, pubkey_hex).
+/// Generate a fresh keypair → (secret_key_hex, pubkey_hex).
 fn gen_keypair() -> (String, String) {
-    let secp = Secp256k1::new();
-    let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
-    let keypair = Keypair::from_secret_key(&secp, &sk);
-    let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
-    (
-        hex::encode(sk.secret_bytes()),
-        hex::encode(xonly.serialize()),
-    )
+    cbcl_nostr::event_signing::generate_keypair()
 }
 
 /// Current unix timestamp in seconds.

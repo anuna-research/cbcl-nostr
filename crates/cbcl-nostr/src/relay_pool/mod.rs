@@ -1,9 +1,10 @@
-//! WebSocket connection pool to Nostr relays.
+//! Nostr relay protocol types and WebSocket connection pool.
 //!
-//! Manages concurrent connections to multiple Nostr relays with automatic
-//! reconnection, event publishing, and subscription management per NIP-01.
+//! The `message` submodule (protocol types, filters, subscription IDs) is
+//! always available. The relay pool and WebSocket connection management
+//! require the `relay` feature (not available on WASM).
 //!
-//! # Example
+//! # Example (requires `relay` feature)
 //!
 //! ```no_run
 //! use cbcl_nostr::relay_pool::{RelayPool, PoolConfig, Filter, SubscriptionId};
@@ -32,18 +33,26 @@
 //! ```
 
 pub mod message;
+#[cfg(feature = "relay")]
 pub mod relay;
 
 pub use message::{ClientMessage, Filter, RelayMessage, SubscriptionId};
+#[cfg(feature = "relay")]
 pub use relay::{ReconnectPolicy, RelayError, RelayStatus};
 
+#[cfg(feature = "relay")]
 use std::collections::HashMap;
+#[cfg(feature = "relay")]
 use std::sync::Arc;
 
+#[cfg(feature = "relay")]
 use tokio::sync::{mpsc, Mutex};
+#[cfg(feature = "relay")]
 use url::Url;
 
+#[cfg(feature = "relay")]
 use crate::event_types::Event;
+#[cfg(feature = "relay")]
 use relay::RelayHandle;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +60,7 @@ use relay::RelayHandle;
 // ---------------------------------------------------------------------------
 
 /// Configuration for the relay pool.
+#[cfg(feature = "relay")]
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Reconnection policy applied to each relay connection.
@@ -59,6 +69,7 @@ pub struct PoolConfig {
     pub incoming_buffer: usize,
 }
 
+#[cfg(feature = "relay")]
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
@@ -73,6 +84,7 @@ impl Default for PoolConfig {
 // ---------------------------------------------------------------------------
 
 /// Errors from relay pool operations.
+#[cfg(feature = "relay")]
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error("invalid relay URL: {0}")]
@@ -90,6 +102,7 @@ pub enum PoolError {
 // ---------------------------------------------------------------------------
 
 /// Result of publishing an event to a single relay.
+#[cfg(feature = "relay")]
 #[derive(Debug, Clone)]
 pub struct PublishResult {
     /// The relay URL that was sent to.
@@ -109,6 +122,7 @@ pub struct PublishResult {
 /// Provides a unified interface for publishing events and managing
 /// subscriptions across multiple relays. Each relay connection runs
 /// as an independent tokio task with automatic reconnection.
+#[cfg(feature = "relay")]
 pub struct RelayPool {
     config: PoolConfig,
     relays: Arc<Mutex<HashMap<Url, RelayHandle>>>,
@@ -116,6 +130,7 @@ pub struct RelayPool {
     incoming_rx: Arc<Mutex<Option<mpsc::Receiver<(Url, RelayMessage)>>>>,
 }
 
+#[cfg(feature = "relay")]
 impl RelayPool {
     /// Create a new relay pool with the given configuration.
     pub fn new(config: PoolConfig) -> Self {
@@ -212,9 +227,6 @@ impl RelayPool {
         let msg = ClientMessage::Req(sub_id.clone(), filters);
 
         for handle in relays.values() {
-            // Best-effort: if a relay is temporarily down, the subscription
-            // will be established when it reconnects (callers should re-subscribe
-            // on reconnection events if needed).
             let _ = handle.send(msg.clone()).await;
         }
 
@@ -238,7 +250,6 @@ impl RelayPool {
     /// This can only be called once; subsequent calls return a receiver that
     /// will never yield messages. Use this to drive your event processing loop.
     pub fn events(&self) -> mpsc::Receiver<(Url, RelayMessage)> {
-        // Try to take the receiver. If already taken, return a dummy channel.
         let mut guard = self.incoming_rx.blocking_lock();
         match guard.take() {
             Some(rx) => rx,
@@ -291,6 +302,7 @@ impl RelayPool {
     }
 }
 
+#[cfg(feature = "relay")]
 impl std::fmt::Debug for RelayPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RelayPool")
@@ -366,7 +378,6 @@ mod tests {
             kinds: Some(vec![21111]),
             ..Default::default()
         }];
-        // Should succeed even with no relays (no-op).
         let result = pool.subscribe(sub_id.clone(), filters).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().0, "test-sub");

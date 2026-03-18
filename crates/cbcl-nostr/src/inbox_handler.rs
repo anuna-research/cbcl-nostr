@@ -293,16 +293,9 @@ mod tests {
     use crate::event_signing::sign_event;
     use crate::event_types::KIND_AGENT_DIALECT;
 
-    /// Generate a secp256k1 keypair and return (secret_key_hex, pubkey_hex).
+    /// Generate a keypair and return (secret_key_hex, pubkey_hex).
     fn gen_keypair() -> (String, String) {
-        use secp256k1::Secp256k1;
-        let secp = Secp256k1::new();
-        let (sk, pk) = secp.generate_keypair(&mut rand::thread_rng());
-        let sk_hex = hex::encode(sk.secret_bytes());
-        // x-only pubkey (32 bytes)
-        let (xonly, _parity) = pk.x_only_public_key();
-        let pk_hex = hex::encode(xonly.serialize());
-        (sk_hex, pk_hex)
+        crate::event_signing::generate_keypair()
     }
 
     /// Build a signed kind 21111 event.

@@ -37,22 +37,13 @@ use cbcl_nostr::zap_integration::{
     KIND_ZAP_RECEIPT, KIND_ZAP_REQUEST,
 };
 
-use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a fresh secp256k1 keypair → (secret_key_hex, pubkey_hex).
+/// Generate a fresh keypair → (secret_key_hex, pubkey_hex).
 fn gen_keypair() -> (String, String) {
-    let secp = Secp256k1::new();
-    let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
-    let keypair = Keypair::from_secret_key(&secp, &sk);
-    let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
-    (
-        hex::encode(sk.secret_bytes()),
-        hex::encode(xonly.serialize()),
-    )
+    cbcl_nostr::event_signing::generate_keypair()
 }
 
 /// Monotonically increasing timestamp for event ordering.

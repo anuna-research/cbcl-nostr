@@ -175,7 +175,9 @@ impl NostrEventSigner {
     fn from_pubkey_hex(pubkey_hex: &str) -> Result<Self, event_signing::SigningError> {
         let bytes = hex::decode(pubkey_hex)?;
         if bytes.len() != 32 {
-            return Err(secp256k1::Error::InvalidPublicKey.into());
+            return Err(event_signing::SigningError::Crypto(
+                "invalid public key length".into(),
+            ));
         }
         let mut pubkey_bytes = [0u8; 32];
         pubkey_bytes.copy_from_slice(&bytes);
@@ -194,15 +196,14 @@ impl Signer for NostrEventSigner {
         if sig.len() != 64 {
             return false;
         }
-        let secp = secp256k1::Secp256k1::verification_only();
-        let Ok(xonly) = secp256k1::XOnlyPublicKey::from_slice(&self.pubkey_bytes) else {
+        let Ok(vk) = k256::schnorr::VerifyingKey::from_bytes(&self.pubkey_bytes) else {
             return false;
         };
-        let Ok(schnorr_sig) = secp256k1::schnorr::Signature::from_slice(sig) else {
+        let Ok(schnorr_sig) = k256::schnorr::Signature::try_from(sig) else {
             return false;
         };
         // The data is the canonical dialect body; verify Schnorr signature
-        secp.verify_schnorr(&schnorr_sig, data, &xonly).is_ok()
+        vk.verify_raw(data, &schnorr_sig).is_ok()
     }
 }
 
@@ -889,13 +890,15 @@ mod tests {
     // ==== Helper ====
 
     fn gen_keypair() -> (String, String) {
-        let secp = secp256k1::Secp256k1::new();
-        let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
-        let keypair = secp256k1::Keypair::from_secret_key(&secp, &sk);
-        let (xonly, _) = secp256k1::XOnlyPublicKey::from_keypair(&keypair);
+        crate::event_signing::generate_keypair()
+    }
+
+    #[allow(dead_code)]
+    fn gen_keypair_tuple() -> (String, String) {
+        let (sk, pk) = crate::event_signing::generate_keypair();
         (
-            hex::encode(sk.secret_bytes()),
-            hex::encode(xonly.serialize()),
+            sk,
+            pk,
         )
     }
 }

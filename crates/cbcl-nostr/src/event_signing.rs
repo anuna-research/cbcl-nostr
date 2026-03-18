@@ -2,13 +2,13 @@
 //!
 //! Provides:
 //! - Event ID computation per NIP-01 (SHA-256 of canonical serialization).
-//! - Schnorr signing and verification using secp256k1.
+//! - Schnorr signing and verification using secp256k1 (via `k256`).
 //! - NIP-44 v2 encrypt/decrypt for private agent-to-agent messages.
 
 #![forbid(unsafe_code)]
 
 use hmac::{Hmac, Mac};
-use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
+use k256::schnorr::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::event_types::Event;
@@ -24,9 +24,9 @@ pub enum SigningError {
     #[error("hex error: {0}")]
     Hex(#[from] hex::FromHexError),
 
-    /// secp256k1 operation failed.
-    #[error("secp256k1 error: {0}")]
-    Secp256k1(#[from] secp256k1::Error),
+    /// Cryptographic operation failed.
+    #[error("crypto error: {0}")]
+    Crypto(String),
 
     /// Event ID does not match computed hash.
     #[error("event id mismatch: expected {expected}, got {got}")]
@@ -40,9 +40,9 @@ pub enum Nip44Error {
     #[error("hex error: {0}")]
     Hex(#[from] hex::FromHexError),
 
-    /// secp256k1 operation failed.
-    #[error("secp256k1 error: {0}")]
-    Secp256k1(#[from] secp256k1::Error),
+    /// Cryptographic operation failed.
+    #[error("crypto error: {0}")]
+    Crypto(String),
 
     /// Base64 decoding failed.
     #[error("base64 error: {0}")]
@@ -95,19 +95,23 @@ pub fn sign_event(
     secret_key_hex: &str,
     created_at: u64,
 ) -> Result<(), SigningError> {
-    let secp = Secp256k1::new();
     let sk_bytes = hex::decode(secret_key_hex)?;
-    let sk = SecretKey::from_slice(&sk_bytes)?;
-    let keypair = Keypair::from_secret_key(&secp, &sk);
-    let (xonly, _parity) = XOnlyPublicKey::from_keypair(&keypair);
+    let signing_key = SigningKey::from_bytes(&sk_bytes)
+        .map_err(|e| SigningError::Crypto(e.to_string()))?;
+    let verifying_key = signing_key.verifying_key();
 
-    event.pubkey = hex::encode(xonly.serialize());
+    // x-only public key (32 bytes)
+    event.pubkey = hex::encode(verifying_key.to_bytes());
     event.created_at = created_at;
     event.id = compute_event_id(event);
 
     let id_bytes = hex::decode(&event.id)?;
-    let sig = secp.sign_schnorr(&id_bytes, &keypair);
-    event.sig = hex::encode(sig.as_ref());
+    let mut aux_rand = [0u8; 32];
+    fill_random(&mut aux_rand);
+    let sig = signing_key
+        .sign_raw(&id_bytes, &aux_rand)
+        .map_err(|e| SigningError::Crypto(e.to_string()))?;
+    event.sig = hex::encode(sig.to_bytes());
 
     Ok(())
 }
@@ -132,14 +136,17 @@ pub fn verify_event(event: &Event) -> Result<(), SigningError> {
     }
 
     // Verify signature
-    let secp = Secp256k1::verification_only();
     let pk_bytes = hex::decode(&event.pubkey)?;
-    let xonly = XOnlyPublicKey::from_slice(&pk_bytes)?;
+    let verifying_key = VerifyingKey::from_bytes(&pk_bytes)
+        .map_err(|e| SigningError::Crypto(e.to_string()))?;
     let id_bytes = hex::decode(&event.id)?;
     let sig_bytes = hex::decode(&event.sig)?;
-    let sig = secp256k1::schnorr::Signature::from_slice(&sig_bytes)?;
+    let signature = k256::schnorr::Signature::try_from(sig_bytes.as_slice())
+        .map_err(|e| SigningError::Crypto(e.to_string()))?;
 
-    secp.verify_schnorr(&sig, &id_bytes, &xonly)?;
+    verifying_key
+        .verify_raw(&id_bytes, &signature)
+        .map_err(|e| SigningError::Crypto(e.to_string()))?;
     Ok(())
 }
 
@@ -160,20 +167,27 @@ pub fn conversation_key(
     secret_key_hex: &str,
     pubkey_hex: &str,
 ) -> Result<[u8; 32], Nip44Error> {
-    let sk_bytes = hex::decode(secret_key_hex)?;
-    let sk = SecretKey::from_slice(&sk_bytes)?;
+    use k256::elliptic_curve::scalar::ScalarPrimitive;
 
-    // Reconstruct full 33-byte compressed public key (02 prefix for even parity)
-    let mut pk_full = [0u8; 33];
-    pk_full[0] = 0x02;
+    let sk_bytes = hex::decode(secret_key_hex)?;
+    let scalar = ScalarPrimitive::<k256::Secp256k1>::from_slice(&sk_bytes)
+        .map_err(|e| Nip44Error::Crypto(e.to_string()))?;
+    let secret_key = k256::SecretKey::new(scalar);
+
+    // Reconstruct compressed public key (02 prefix + 32-byte x-coordinate)
     let pk_bytes = hex::decode(pubkey_hex)?;
-    pk_full[1..].copy_from_slice(&pk_bytes);
-    let pk = PublicKey::from_slice(&pk_full)?;
+    let mut pk_compressed = [0u8; 33];
+    pk_compressed[0] = 0x02;
+    pk_compressed[1..].copy_from_slice(&pk_bytes);
+    let public_key = k256::PublicKey::from_sec1_bytes(&pk_compressed)
+        .map_err(|e| Nip44Error::Crypto(e.to_string()))?;
 
     // ECDH: shared point x-coordinate
-    let shared = secp256k1::ecdh::shared_secret_point(&pk, &sk);
-    // shared_secret_point returns 64 bytes (x || y), we want the first 32 (x)
-    let shared_x = &shared[..32];
+    let shared_point = k256::ecdh::diffie_hellman(
+        secret_key.to_nonzero_scalar(),
+        public_key.as_affine(),
+    );
+    let shared_x = shared_point.raw_secret_bytes();
 
     // HKDF extract
     let hk = hkdf::Hkdf::<Sha256>::new(Some(NIP44_SALT), shared_x);
@@ -247,7 +261,7 @@ pub fn nip44_encrypt(
     use chacha20poly1305::{ChaCha20Poly1305, aead::Aead};
 
     let mut nonce_bytes = [0u8; 32];
-    getrandom(&mut nonce_bytes);
+    fill_random(&mut nonce_bytes);
 
     let padded = pad_plaintext(plaintext.as_bytes());
     let (chacha_key, chacha_nonce, hmac_key) = message_keys(conversation_key, &nonce_bytes);
@@ -327,10 +341,27 @@ pub fn nip44_decrypt(
         .map_err(|_| Nip44Error::InvalidPayload("plaintext is not valid UTF-8".into()))
 }
 
-/// Fill a buffer with random bytes using the system RNG.
-fn getrandom(buf: &mut [u8]) {
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(buf);
+/// Fill a buffer with random bytes.
+fn fill_random(buf: &mut [u8]) {
+    ::getrandom::getrandom(buf).expect("getrandom failed");
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for key generation (used internally and in tests)
+// ---------------------------------------------------------------------------
+
+/// Generate a fresh keypair, returning (secret_key_hex, pubkey_hex).
+///
+/// The pubkey is the 32-byte x-only key used in Nostr.
+pub fn generate_keypair() -> (String, String) {
+    let mut sk_bytes = [0u8; 32];
+    loop {
+        fill_random(&mut sk_bytes);
+        if let Ok(signing_key) = SigningKey::from_bytes(&sk_bytes) {
+            let vk = signing_key.verifying_key();
+            return (hex::encode(sk_bytes), hex::encode(vk.to_bytes()));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,13 +372,8 @@ fn getrandom(buf: &mut [u8]) {
 mod tests {
     use super::*;
 
-    /// Generate a fresh keypair, returning (secret_key_hex, pubkey_hex).
     fn gen_keypair() -> (String, String) {
-        let secp = Secp256k1::new();
-        let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
-        let keypair = Keypair::from_secret_key(&secp, &sk);
-        let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
-        (hex::encode(sk.secret_bytes()), hex::encode(xonly.serialize()))
+        generate_keypair()
     }
 
     fn unsigned_event(content: &str) -> Event {

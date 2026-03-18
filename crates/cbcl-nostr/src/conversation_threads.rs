@@ -52,10 +52,9 @@ impl std::fmt::Display for ThreadId {
     }
 }
 
-/// Fill `buf` with random bytes using the `rand` crate's thread-local RNG.
+/// Fill `buf` with random bytes.
 fn getrandom(buf: &mut [u8]) {
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(buf);
+    ::getrandom::getrandom(buf).expect("getrandom failed");
 }
 
 // ---------------------------------------------------------------------------

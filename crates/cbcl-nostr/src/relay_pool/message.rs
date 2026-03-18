@@ -19,11 +19,9 @@ impl SubscriptionId {
 
     /// Generate a random subscription ID.
     pub fn generate() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        let mut buf = [0u8; 8];
+        ::getrandom::getrandom(&mut buf).expect("getrandom failed");
+        let nonce = u64::from_le_bytes(buf);
         Self(format!("sub_{nonce:x}"))
     }
 }
@@ -286,8 +284,6 @@ mod tests {
     #[test]
     fn subscription_id_generate_is_unique() {
         let a = SubscriptionId::generate();
-        // Small sleep to ensure different nanos.
-        std::thread::sleep(std::time::Duration::from_nanos(1));
         let b = SubscriptionId::generate();
         assert_ne!(a, b);
     }
